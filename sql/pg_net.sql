@@ -8,8 +8,8 @@ check (
 
 -- Store pending requests. The background worker reads from here
 -- API: Private
-create table net.http_request_queue(
-    id bigserial primary key,
+create unlogged table net.http_request_queue(
+    id bigserial,
     method net.http_method not null,
     url text not null,
     headers jsonb not null,
@@ -18,29 +18,21 @@ create table net.http_request_queue(
     timeout_milliseconds int not null
 );
 
-create or replace function net._check_worker_is_up() returns trigger as $$
+create or replace function net.check_worker_is_up() returns void as $$
 begin
   if not exists (select pid from pg_stat_activity where backend_type = 'pg_net worker') then
     raise exception using
-      message = 'the pg_net background worker must be up when doing requests'
+      message = 'the pg_net background worker is not up'
     , detail  = 'the pg_net background worker is down due to an internal error and cannot process requests'
-    , hint    = 'make sure that you didn''t modify any of pg_net internal tables or used them for foreign key references';
-    return null;
+    , hint    = 'make sure that you didn''t modify any of pg_net internal tables';
   end if;
-  return new;
 end
 $$ language plpgsql;
 
-create trigger ensure_worker_is_up
-after insert on net.http_request_queue
-for each statement
-execute procedure net._check_worker_is_up();
-
-
 -- Associates a response with a request
 -- API: Private
-create table net._http_response(
-    id bigint primary key,
+create unlogged table net._http_response(
+    id bigint,
     status_code integer,
     content_type text,
     headers jsonb,
@@ -49,8 +41,6 @@ create table net._http_response(
     error_msg text,
     created timestamptz not null default now()
 );
-
-create index on net._http_response (created);
 
 -- Blocks until an http_request is complete
 -- API: Private
@@ -98,7 +88,7 @@ as 'pg_net';
 create or replace function net._encode_url_with_params_array(url text, params_array text[])
     -- url encoded string
     returns text
-
+    strict
     language 'c'
     immutable
 as 'pg_net';
