@@ -14,7 +14,6 @@ create unlogged table net.http_request_queue(
     url text not null,
     headers jsonb not null,
     body bytea,
-    -- TODO: respect this
     timeout_milliseconds int not null
 );
 
@@ -41,6 +40,8 @@ create unlogged table net._http_response(
     error_msg text,
     created timestamptz not null default now()
 );
+
+create index on net._http_response (created);
 
 -- Blocks until an http_request is complete
 -- API: Private
@@ -104,7 +105,7 @@ create or replace function net.http_get(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 2000
 )
     -- request_id reference
     returns bigint
@@ -149,7 +150,7 @@ create or replace function net.http_post(
     -- key/values to be included in request headers
     headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int DEFAULT 1000
+    timeout_milliseconds int DEFAULT 2000
 )
     -- request_id reference
     returns bigint
@@ -183,11 +184,6 @@ begin
     -- Confirm that the content-type is set as "application/json"
     if content_type <> 'application/json' then
         raise exception 'Content-Type header must be "application/json"';
-    end if;
-
-    -- Confirm body is set since http method switches on if body exists
-    if body is null then
-        raise exception 'body must not be null';
     end if;
 
     select
