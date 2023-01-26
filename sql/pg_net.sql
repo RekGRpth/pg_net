@@ -2,45 +2,37 @@ create schema if not exists net;
 
 create domain net.http_method as text
 check (
-    value ilike 'get' or
-    value ilike 'post'
+  value ilike 'get'
+  or value ilike 'post'
+  or value ilike 'delete'
 );
 
 -- Store pending requests. The background worker reads from here
 -- API: Private
-create table net.http_request_queue(
-    id bigserial primary key,
+create unlogged table net.http_request_queue(
+    id bigserial,
     method net.http_method not null,
     url text not null,
     headers jsonb not null,
     body bytea,
-    -- TODO: respect this
     timeout_milliseconds int not null
 );
 
-create or replace function net._check_worker_is_up() returns trigger as $$
+create or replace function net.check_worker_is_up() returns void as $$
 begin
   if not exists (select pid from pg_stat_activity where backend_type = 'pg_net worker') then
     raise exception using
-      message = 'the pg_net background worker must be up when doing requests'
+      message = 'the pg_net background worker is not up'
     , detail  = 'the pg_net background worker is down due to an internal error and cannot process requests'
-    , hint    = 'make sure that you didn''t modify any of pg_net internal tables or used them for foreign key references';
-    return null;
+    , hint    = 'make sure that you didn''t modify any of pg_net internal tables';
   end if;
-  return new;
 end
 $$ language plpgsql;
 
-create trigger ensure_worker_is_up
-after insert on net.http_request_queue
-for each statement
-execute procedure net._check_worker_is_up();
-
-
 -- Associates a response with a request
 -- API: Private
-create table net._http_response(
-    id bigint primary key,
+create unlogged table net._http_response(
+    id bigint,
     status_code integer,
     content_type text,
     headers jsonb,
@@ -98,7 +90,7 @@ as 'pg_net';
 create or replace function net._encode_url_with_params_array(url text, params_array text[])
     -- url encoded string
     returns text
-
+    strict
     language 'c'
     immutable
 as 'pg_net';
@@ -114,7 +106,7 @@ create or replace function net.http_get(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 2000
 )
     -- request_id reference
     returns bigint
@@ -122,6 +114,7 @@ create or replace function net.http_get(
     volatile
     parallel safe
     language plpgsql
+    security definer
 as $$
 declare
     request_id bigint;
@@ -158,13 +151,14 @@ create or replace function net.http_post(
     -- key/values to be included in request headers
     headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int DEFAULT 1000
+    timeout_milliseconds int DEFAULT 2000
 )
     -- request_id reference
     returns bigint
     volatile
     parallel safe
     language plpgsql
+    security definer
 as $$
 declare
     request_id bigint;
@@ -193,11 +187,6 @@ begin
         raise exception 'Content-Type header must be "application/json"';
     end if;
 
-    -- Confirm body is set since http method switches on if body exists
-    if body is null then
-        raise exception 'body must not be null';
-    end if;
-
     select
         coalesce(array_agg(net._urlencode_string(key) || '=' || net._urlencode_string(value)), '{}')
     into
@@ -212,6 +201,49 @@ begin
         net._encode_url_with_params_array(url, params_array),
         headers,
         convert_to(body::text, 'UTF8'),
+        timeout_milliseconds
+    )
+    returning id
+    into request_id;
+
+    return request_id;
+end
+$$;
+
+-- Interface to make an async request
+-- API: Public
+create or replace function net.http_delete(
+    -- url for the request
+    url text,
+    -- key/value pairs to be url encoded and appended to the `url`
+    params jsonb default '{}'::jsonb,
+    -- key/values to be included in request headers
+    headers jsonb default '{}'::jsonb,
+    -- the maximum number of milliseconds the request may take before being cancelled
+    timeout_milliseconds int default 2000
+)
+    -- request_id reference
+    returns bigint
+    strict
+    volatile
+    parallel safe
+    language plpgsql
+    security definer
+as $$
+declare
+    request_id bigint;
+    params_array text[];
+begin
+    select coalesce(array_agg(net._urlencode_string(key) || '=' || net._urlencode_string(value)), '{}')
+    into params_array
+    from jsonb_each_text(params);
+
+    -- Add to the request queue
+    insert into net.http_request_queue(method, url, headers, timeout_milliseconds)
+    values (
+        'DELETE',
+        net._encode_url_with_params_array(url, params_array),
+        headers,
         timeout_milliseconds
     )
     returning id
@@ -244,8 +276,8 @@ create type net.http_response_result as (
 
 
 -- Collect respones of an http request
--- API: Public
-create or replace function net.http_collect_response(
+-- API: Private
+create or replace function net._http_collect_response(
     -- request_id reference
     request_id bigint,
     -- when `true`, return immediately. when `false` wait for the request to complete before returning
@@ -257,6 +289,7 @@ create or replace function net.http_collect_response(
     volatile
     parallel safe
     language plpgsql
+    security definer
 as $$
 declare
     rec net._http_response;

@@ -1,4 +1,5 @@
 from sqlalchemy import text
+import time
 
 
 def test_http_get_returns_id(sess):
@@ -6,7 +7,7 @@ def test_http_get_returns_id(sess):
 
     (request_id,) = sess.execute(
         """
-        select net.http_get('https://news.ycombinator.com'); 
+        select net.http_get('https://news.ycombinator.com');
     """
     ).fetchone()
 
@@ -30,7 +31,7 @@ def test_http_get_collect_sync_success(sess):
     response = sess.execute(
         text(
             """
-        select * from net.http_collect_response(:request_id, async:=false);
+        select * from net._http_collect_response(:request_id, async:=false);
     """
         ),
         {"request_id": request_id},
@@ -61,7 +62,7 @@ def test_http_get_collect_sync_success(sess):
 #     response = sess.execute(
 #         text(
 #             """
-#         select * from net.http_collect_response(:request_id, async:=true);
+#         select * from net._http_collect_response(:request_id, async:=true);
 #     """
 #         ),
 #         {"request_id": request_id},
@@ -79,10 +80,48 @@ def test_http_collect_response_async_does_not_exist(sess):
     # Collect the response, waiting as needed
     response = sess.execute(
         """
-        select * from net.http_collect_response(1, async:=true);
+        select * from net._http_collect_response(1, async:=true);
     """
     ).fetchone()
 
     assert response[0] == "ERROR"
     assert "not found" in response[1]
     assert response[2] is None
+
+def test_http_get_responses_have_different_created_times(sess):
+    """Ensure the rows in net._http_response have different created times"""
+
+    sess.execute(
+        """
+        select net.http_get('http://localhost:8080/echo-method')
+    """
+    )
+    sess.commit()
+
+    time.sleep(1)
+
+    sess.execute(
+        """
+        select net.http_get('http://localhost:8080/echo-method')
+    """
+    )
+    sess.commit()
+
+    time.sleep(1)
+
+    sess.execute(
+        """
+        select net.http_get('http://localhost:8080/echo-method')
+    """
+    )
+    sess.commit()
+
+    time.sleep(1)
+
+    count = sess.execute(
+            """
+        select count(distinct created) from net._http_response;
+    """
+    ).scalar()
+
+    assert count == 3
