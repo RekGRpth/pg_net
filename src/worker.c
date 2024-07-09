@@ -32,6 +32,25 @@
 
 #include "util.h"
 
+#define CURL_EZ_SETOPT(hdl, opt, prm) \
+  do { \
+			if (curl_easy_setopt(hdl, opt, prm) != CURLE_OK) \
+				ereport(ERROR, errmsg("Could not curl_easy_setopt(%s)", #opt)); \
+  } while (0)
+
+#define CURL_EZ_GETINFO(hdl, opt, prm) \
+  do { \
+			if (curl_easy_getinfo(hdl, opt, prm) != CURLE_OK) \
+				ereport(ERROR, errmsg("Could not curl_easy_getinfo(%s)", #opt)); \
+  } while (0)
+
+#define EREPORT_NULL_ATTR(tupIsNull, attr) \
+  do { \
+		if (tupIsNull) \
+			ereport(ERROR, errmsg("%s cannot be null", #attr)); \
+  } while (0)
+
+
 PG_MODULE_MAGIC;
 
 static char *ttl = "6 hours";
@@ -102,7 +121,7 @@ header_cb(void *contents, size_t size, size_t nmemb, void *userp)
 	return realsize;
 }
 
-static CURLMcode init(CURLM *cm, char *method, char *url, int timeout_milliseconds, struct curl_slist *request_headers, char *reqBody, int64 id, CurlData *cdata)
+static void init(CURLM *cm, char *method, char *url, int timeout_milliseconds, struct curl_slist *request_headers, char *reqBody, int64 id, CurlData *cdata)
 {
 	CURL *eh = curl_easy_init();
 
@@ -113,49 +132,55 @@ static CURLMcode init(CURLM *cm, char *method, char *url, int timeout_millisecon
 	(void)pushJsonbValue(&response_headers, WJB_BEGIN_OBJECT, NULL);
 	cdata->response_headers = response_headers;
 	cdata->id = id;
-	cdata->request_headers = request_headers;
 
-	request_headers = curl_slist_append(request_headers, "User-Agent: pg_net/" EXTVERSION);
+	struct curl_slist *new_headers = curl_slist_append(request_headers, "User-Agent: pg_net/" EXTVERSION);
+	if(new_headers == NULL)
+		ereport(ERROR, errmsg("curl_slist_append returned NULL"));
+
+	cdata->request_headers = new_headers;
 
 	if (strcasecmp(method, "GET") == 0) {
 		if (reqBody) {
-			curl_easy_setopt(eh, CURLOPT_POSTFIELDS, reqBody);
-			curl_easy_setopt(eh, CURLOPT_CUSTOMREQUEST, "GET");
+			CURL_EZ_SETOPT(eh, CURLOPT_POSTFIELDS, reqBody);
+			CURL_EZ_SETOPT(eh, CURLOPT_CUSTOMREQUEST, "GET");
 		}
 	}
 
 	if (strcasecmp(method, "POST") == 0) {
 		if (reqBody) {
-			curl_easy_setopt(eh, CURLOPT_POSTFIELDS, reqBody);
+			CURL_EZ_SETOPT(eh, CURLOPT_POSTFIELDS, reqBody);
 		}
 		else {
-			curl_easy_setopt(eh, CURLOPT_POST, 1);
-			curl_easy_setopt(eh, CURLOPT_POSTFIELDSIZE, 0);
+			CURL_EZ_SETOPT(eh, CURLOPT_POST, 1);
+			CURL_EZ_SETOPT(eh, CURLOPT_POSTFIELDSIZE, 0);
 		}
 	}
 
 	if (strcasecmp(method, "DELETE") == 0) {
-		curl_easy_setopt(eh, CURLOPT_CUSTOMREQUEST, "DELETE");
+		CURL_EZ_SETOPT(eh, CURLOPT_CUSTOMREQUEST, "DELETE");
 	}
 
-	curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, body_cb);
-	curl_easy_setopt(eh, CURLOPT_WRITEDATA, cdata->body);
-	curl_easy_setopt(eh, CURLOPT_HEADERFUNCTION, header_cb);
-	curl_easy_setopt(eh, CURLOPT_HEADERDATA, cdata->response_headers);
-	curl_easy_setopt(eh, CURLOPT_HEADER, 0L);
-	curl_easy_setopt(eh, CURLOPT_URL, url);
-	curl_easy_setopt(eh, CURLOPT_HTTPHEADER, cdata->request_headers);
-	curl_easy_setopt(eh, CURLOPT_TIMEOUT_MS, timeout_milliseconds);
-	curl_easy_setopt(eh, CURLOPT_PRIVATE, cdata);
-	curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, true);
+	CURL_EZ_SETOPT(eh, CURLOPT_WRITEFUNCTION, body_cb);
+	CURL_EZ_SETOPT(eh, CURLOPT_WRITEDATA, cdata->body);
+	CURL_EZ_SETOPT(eh, CURLOPT_HEADERFUNCTION, header_cb);
+	CURL_EZ_SETOPT(eh, CURLOPT_HEADERDATA, cdata->response_headers);
+	CURL_EZ_SETOPT(eh, CURLOPT_HEADER, 0L);
+	CURL_EZ_SETOPT(eh, CURLOPT_URL, url);
+	CURL_EZ_SETOPT(eh, CURLOPT_HTTPHEADER, cdata->request_headers);
+	CURL_EZ_SETOPT(eh, CURLOPT_TIMEOUT_MS, timeout_milliseconds);
+	CURL_EZ_SETOPT(eh, CURLOPT_PRIVATE, cdata);
+	CURL_EZ_SETOPT(eh, CURLOPT_FOLLOWLOCATION, true);
 	if (log_min_messages <= DEBUG1)
-		curl_easy_setopt(eh, CURLOPT_VERBOSE, 1L);
+		CURL_EZ_SETOPT(eh, CURLOPT_VERBOSE, 1L);
 #if LIBCURL_VERSION_NUM >= 0x075500 /* libcurl 7.85.0 */
-	curl_easy_setopt(eh, CURLOPT_PROTOCOLS_STR, "http,https");
+	CURL_EZ_SETOPT(eh, CURLOPT_PROTOCOLS_STR, "http,https");
 #else
-	curl_easy_setopt(eh, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+	CURL_EZ_SETOPT(eh, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
-	return curl_multi_add_handle(cm, eh);
+
+	CURLMcode code = curl_multi_add_handle(cm, eh);
+	if(code != CURLM_OK)
+		ereport(ERROR, errmsg("curl_multi_add_handle returned %s", curl_multi_strerror(code)));
 }
 
 bool is_extension_loaded(){
@@ -171,7 +196,7 @@ bool is_extension_loaded(){
 void
 worker_main(Datum main_arg)
 {
-	CURLM *cm=NULL;
+	CURLM *curl_mhandle=NULL;
 	CURL *eh=NULL;
 	CURLMsg *msg=NULL;
 	int still_running=0, msgs_left=0;
@@ -261,19 +286,30 @@ worker_main(Datum main_arg)
 				res = curl_global_init(CURL_GLOBAL_ALL);
 
 				if(res) {
-					elog(ERROR, "error: curl_global_init() returned %d\n", res);
+					ereport(ERROR, errmsg("curl_global_init() returned %s\n", curl_easy_strerror(res)));
 				}
 
-				cm = curl_multi_init();
+				curl_mhandle = curl_multi_init();
+
+				if(!curl_mhandle) {
+					ereport(ERROR, errmsg("curl_multi_init()"));
+				}
 
 				for (int j = 0; j < SPI_processed; j++)
 				{
 						struct curl_slist *request_headers = NULL;
 
 						int64 id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &tupIsNull));
+						EREPORT_NULL_ATTR(tupIsNull, id);
+
 						char *method = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &tupIsNull));
+						EREPORT_NULL_ATTR(tupIsNull, method);
+
 						char *url = TextDatumGetCString(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 3, &tupIsNull));
+						EREPORT_NULL_ATTR(tupIsNull, url);
+
 						int32 timeout_milliseconds = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 4, &tupIsNull));
+						EREPORT_NULL_ATTR(tupIsNull, timeout_milliseconds);
 
 						Datum headersBin;
 						Datum bodyBin;
@@ -282,7 +318,7 @@ worker_main(Datum main_arg)
 						CurlData *cdata;
 
 						if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "POST") != 0 && strcasecmp(method, "DELETE") != 0) {
-							elog(ERROR, "error: Unsupported request method %s\n", method);
+							ereport(ERROR, errmsg("Unsupported request method %s", method));
 						}
 
 						headersBin = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 5, &tupIsNull);
@@ -295,11 +331,7 @@ worker_main(Datum main_arg)
 
 						cdata = palloc(sizeof(CurlData));
 
-						res = init(cm, method, url, timeout_milliseconds, request_headers, body, id, cdata);
-
-						if(res) {
-							elog(ERROR, "error: init() returned %d\n", res);
-						}
+						init(curl_mhandle, method, url, timeout_milliseconds, request_headers, body, id, cdata);
 				}
 			}
 			else
@@ -311,22 +343,22 @@ worker_main(Datum main_arg)
 		do {
 				int numfds=0;
 
-				res = curl_multi_perform(cm, &still_running);
+				res = curl_multi_perform(curl_mhandle, &still_running);
 
 				if(res != CURLM_OK) {
-						elog(ERROR, "error: curl_multi_perform() returned %d\n", res);
+						ereport(ERROR, errmsg("error: curl_multi_perform() returned %d", res));
 				}
 
 				/*wait at least 1 second(1000 ms) in case all responses are slow*/
 				/*this avoids busy waiting and higher CPU usage*/
-				res = curl_multi_wait(cm, NULL, 0, 1000, &numfds);
+				res = curl_multi_wait(curl_mhandle, NULL, 0, 1000, &numfds);
 
 				if(res != CURLM_OK) {
-						elog(ERROR, "error: curl_multi_wait() returned %d\n", res);
+						ereport(ERROR, errmsg("error: curl_multi_wait() returned %d", res));
 				}
 		} while(still_running);
 
-		while ((msg = curl_multi_info_read(cm, &msgs_left))) {
+		while ((msg = curl_multi_info_read(curl_mhandle, &msgs_left))) {
 				if (msg->msg == CURLMSG_DONE) {
 						CURLcode return_code = msg->data.result;
 						eh = msg->easy_handle;
@@ -334,7 +366,7 @@ worker_main(Datum main_arg)
 						if (return_code != CURLE_OK) {
 							CurlData *cdata = NULL;
 
-							curl_easy_getinfo(eh, CURLINFO_PRIVATE, &cdata);
+							CURL_EZ_GETINFO(eh, CURLINFO_PRIVATE, &cdata);
 
 							int failed_query_rc = SPI_execute_with_args("\
 									insert into net._http_response(id, error_msg) values ($1, $2)",
@@ -352,9 +384,9 @@ worker_main(Datum main_arg)
 							char *contentType = NULL;
 							long http_status_code;
 
-							curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &http_status_code);
-							curl_easy_getinfo(eh, CURLINFO_CONTENT_TYPE, &contentType);
-							curl_easy_getinfo(eh, CURLINFO_PRIVATE, &cdata);
+							CURL_EZ_GETINFO(eh, CURLINFO_RESPONSE_CODE, &http_status_code);
+							CURL_EZ_GETINFO(eh, CURLINFO_CONTENT_TYPE, &contentType);
+							CURL_EZ_GETINFO(eh, CURLINFO_PRIVATE, &cdata);
 
 							int succ_query_rc = SPI_execute_with_args("\
 									insert into net._http_response(id, status_code, content, headers, content_type, timed_out) values ($1, $2, $3, $4, $5, $6)",
@@ -383,18 +415,24 @@ worker_main(Datum main_arg)
 
 							pfree(cdata->body->data);
 							pfree(cdata->body);
-							curl_slist_free_all(cdata->request_headers);
+							if(cdata->request_headers) //curl_slist_free_all already handles the NULL case, but be explicit about it
+								curl_slist_free_all(cdata->request_headers);
 							pfree(cdata);
 						}
 
-						curl_multi_remove_handle(cm, eh);
+						res = curl_multi_remove_handle(curl_mhandle, eh);
+						if(res != CURLM_OK)
+							ereport(ERROR, errmsg("curl_multi_remove_handle: %s", curl_multi_strerror(res)));
+
 						curl_easy_cleanup(eh);
 				} else {
-						elog(ERROR, "error: after curl_multi_info_read(), CURLMsg=%d\n", msg->msg);
+						ereport(ERROR, errmsg("curl_multi_info_read(), CURLMsg=%d\n", msg->msg));
 				}
 		}
 
-		curl_multi_cleanup(cm);
+		res = curl_multi_cleanup(curl_mhandle);
+		if(res != CURLM_OK)
+			ereport(ERROR, errmsg("curl_multi_cleanup: %s", curl_multi_strerror(res)));
 
 		SPI_finish();
 		PopActiveSnapshot();
