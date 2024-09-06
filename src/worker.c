@@ -31,9 +31,9 @@ _Static_assert(LIBCURL_VERSION_NUM >= MIN_LIBCURL_VERSION_NUM, "libcurl >= 7.83.
 
 PG_MODULE_MAGIC;
 
-static char *guc_ttl = "6 hours";
-static int guc_batch_size = 500;
-static char* guc_database_name = "postgres";
+static char *guc_ttl;
+static int guc_batch_size;
+static char* guc_database_name;
 
 void _PG_init(void);
 PGDLLEXPORT void pg_net_worker(Datum main_arg) pg_attribute_noreturn();
@@ -136,8 +136,7 @@ static void insert_success_response(CurlData *cdata, long http_status_code, char
       , CStringGetDatum(cdata->body->data)
       , JsonbPGetDatum(jsonb_headers)
       , CStringGetDatum(contentType)
-      // TODO Why is this hardcoded?
-      , BoolGetDatum(false)
+      , BoolGetDatum(false) // timed_out is false here as it's a success
       },
       (char[6]){
         ' '
@@ -411,9 +410,7 @@ void pg_net_worker(Datum main_arg) {
   proc_exit(EXIT_FAILURE);
 }
 
-void
-_PG_init(void)
-{
+void _PG_init(void) {
   if (IsBinaryUpgrade) {
       return;
   }
