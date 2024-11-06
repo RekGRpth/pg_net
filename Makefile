@@ -1,6 +1,6 @@
 PG_CFLAGS = -std=c11 -Werror -Wno-declaration-after-statement
 EXTENSION = pg_net
-EXTVERSION = 0.12.0
+EXTVERSION = 0.13.0
 
 DATA = $(wildcard sql/*--*.sql)
 
@@ -9,7 +9,7 @@ REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --use-existing --inputdir=test
 
 MODULE_big = $(EXTENSION)
-OBJS = src/worker.o src/util.o src/core.o
+OBJS = src/worker.o src/util.o src/core.o src/event.o
 
 all: sql/$(EXTENSION)--$(EXTVERSION).sql $(EXTENSION).control
 
