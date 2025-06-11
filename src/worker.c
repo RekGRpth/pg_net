@@ -110,7 +110,7 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
     CHECK_FOR_INTERRUPTS();
 
     if(!is_extension_loaded()){
-      elog(DEBUG2, "pg_net_worker: extension not yet loaded");
+      elog(DEBUG1, "pg_net worker: extension not yet loaded");
       continue;
     }
 
