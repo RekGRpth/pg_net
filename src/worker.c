@@ -32,6 +32,7 @@ typedef struct {
 
 WorkerState *worker_state = NULL;
 
+static const int                curl_handle_event_timeout_ms = 1000;
 static char*                    guc_ttl;
 static int                      guc_batch_size;
 static char*                    guc_database_name;
@@ -39,7 +40,6 @@ static char*                    guc_username;
 static MemoryContext            CurlMemContext = NULL;
 static shmem_startup_hook_type  prev_shmem_startup_hook = NULL;
 static long                     latch_timeout = 1000;
-static volatile sig_atomic_t    got_sigterm = false;
 static volatile sig_atomic_t    got_sighup = false;
 
 void _PG_init(void);
@@ -77,7 +77,8 @@ static void
 handle_sigterm(__attribute__ ((unused)) SIGNAL_ARGS)
 {
   int save_errno = errno;
-  got_sigterm = true;
+  pg_atomic_write_u32(&worker_state->should_restart, 1);
+  pg_write_barrier();
   if (worker_state)
     SetLatch(&worker_state->latch);
   errno = save_errno;
@@ -143,7 +144,7 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
 
   set_curl_mhandle(lstate.curl_mhandle, &lstate);
 
-  while (!got_sigterm) {
+  while (!pg_atomic_read_u32(&worker_state->should_restart)) {
     WaitLatch(&worker_state->latch,
           WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
           latch_timeout,
@@ -164,8 +165,7 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
       ProcessConfigFile(PGC_SIGHUP);
     }
 
-    if (pg_atomic_read_u32(&worker_state->should_restart) == 1){
-      elog(INFO, "Restarting pg_net worker");
+    if (pg_atomic_read_u32(&worker_state->should_restart) == 1){ // if a restart is issued, make sure we do it again after waiting
       break;
     }
 
@@ -185,7 +185,7 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
     event *events = palloc0(sizeof(event) * maxevents);
 
     do {
-      int nfds = wait_event(lstate.epfd, events, maxevents, 1000);
+      int nfds = wait_event(lstate.epfd, events, maxevents, curl_handle_event_timeout_ms);
       if (nfds < 0) {
         int save_errno = errno;
         if(save_errno == EINTR) { // can happen when the wait is interrupted, for example when running under GDB. Just continue in this case.
@@ -218,7 +218,8 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
         insert_curl_responses(&lstate, CurlMemContext);
       }
 
-    } while (running_handles > 0); // run again while there are curl handles, this will prevent waiting for the latch_timeout (which will cause the cause the curl timeouts to be wrong)
+      elog(DEBUG1, "Pending curl running_handles: %d", running_handles);
+    } while (running_handles > 0); // run while there are curl handles, some won't finish in a single iteration since they could be slow and waiting for a timeout
 
     pfree(events);
 
@@ -289,7 +290,7 @@ void _PG_init(void) {
                  "should be a valid interval type",
                  &guc_ttl,
                  "6 hours",
-                 PGC_SUSET, 0,
+                 PGC_SIGHUP, 0,
                  NULL, NULL, NULL);
 
   DefineCustomIntVariable("pg_net.batch_size",
@@ -298,7 +299,7 @@ void _PG_init(void) {
                  &guc_batch_size,
                  200,
                  0, PG_INT16_MAX,
-                 PGC_SUSET, 0,
+                 PGC_SIGHUP, 0,
                  NULL, NULL, NULL);
 
   DefineCustomStringVariable("pg_net.database_name",
@@ -306,7 +307,7 @@ void _PG_init(void) {
                 NULL,
                 &guc_database_name,
                 "postgres",
-                PGC_SIGHUP, 0,
+                PGC_SU_BACKEND, 0,
                 NULL, NULL, NULL);
 
   DefineCustomStringVariable("pg_net.username",
@@ -314,6 +315,6 @@ void _PG_init(void) {
                 NULL,
                 &guc_username,
                 NULL,
-                PGC_SIGHUP, 0,
+                PGC_SU_BACKEND, 0,
                 NULL, NULL, NULL);
 }
