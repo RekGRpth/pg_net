@@ -129,11 +129,15 @@ static void init_curl_handle(CURLM *curl_mhandle, MemoryContext curl_memctx, int
   MemoryContextSwitchTo(old_ctx);
 }
 
-void set_curl_mhandle(CURLM *curl_mhandle, LoopState *lstate){
-  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_SOCKETFUNCTION, multi_socket_cb);
-  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_SOCKETDATA, lstate);
-  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_TIMERFUNCTION, multi_timer_cb);
-  EREPORT_CURL_MULTI_SETOPT(curl_mhandle, CURLMOPT_TIMERDATA, lstate);
+void set_curl_mhandle(WorkerState *wstate){
+  wstate->curl_mhandle = curl_multi_init();
+  if(!wstate->curl_mhandle)
+    ereport(ERROR, errmsg("curl_multi_init()"));
+
+  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_SOCKETFUNCTION, multi_socket_cb);
+  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_SOCKETDATA, wstate);
+  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_TIMERFUNCTION, multi_timer_cb);
+  EREPORT_CURL_MULTI_SETOPT(wstate->curl_mhandle, CURLMOPT_TIMERDATA, wstate);
 }
 
 uint64 delete_expired_responses(char *ttl, int batch_size){
@@ -175,8 +179,6 @@ uint64 delete_expired_responses(char *ttl, int batch_size){
 }
 
 static void insert_failure_response(CURL *ez_handle, CURLcode return_code, int64 id, int32 timeout_milliseconds){
-  StartTransactionCommand();
-  PushActiveSnapshot(GetTransactionSnapshot());
   SPI_connect();
 
   const char* error_msg;
@@ -199,13 +201,9 @@ static void insert_failure_response(CURL *ez_handle, CURLcode return_code, int64
   }
 
   SPI_finish();
-  PopActiveSnapshot();
-  CommitTransactionCommand();
 }
 
 static void insert_success_response(CurlData *cdata, long http_status_code, char *contentType, Jsonb *jsonb_headers){
-  StartTransactionCommand();
-  PushActiveSnapshot(GetTransactionSnapshot());
   SPI_connect();
 
   int ret_code = SPI_execute_with_args("\
@@ -233,13 +231,9 @@ static void insert_success_response(CurlData *cdata, long http_status_code, char
   }
 
   SPI_finish();
-  PopActiveSnapshot();
-  CommitTransactionCommand();
 }
 
 uint64 consume_request_queue(CURLM *curl_mhandle, int batch_size, MemoryContext curl_memctx){
-  StartTransactionCommand();
-  PushActiveSnapshot(GetTransactionSnapshot());
   SPI_connect();
 
   int ret_code = SPI_execute_with_args("\
@@ -292,8 +286,6 @@ uint64 consume_request_queue(CURLM *curl_mhandle, int batch_size, MemoryContext 
   }
 
   SPI_finish();
-  PopActiveSnapshot();
-  CommitTransactionCommand();
 
   return affected_rows;
 }
@@ -325,11 +317,11 @@ static Jsonb *jsonb_headers_from_curl_handle(CURL *ez_handle){
 }
 
 // Switch back to the curl memory context, which has the curl handles stored
-void insert_curl_responses(LoopState *lstate, MemoryContext curl_memctx){
+void insert_curl_responses(WorkerState *wstate, MemoryContext curl_memctx){
   MemoryContext old_ctx = MemoryContextSwitchTo(curl_memctx);
   int msgs_left=0;
   CURLMsg *msg = NULL;
-  CURLM *curl_mhandle = lstate->curl_mhandle;
+  CURLM *curl_mhandle = wstate->curl_mhandle;
 
   while ((msg = curl_multi_info_read(curl_mhandle, &msgs_left))) {
     if (msg->msg == CURLMSG_DONE) {
