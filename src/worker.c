@@ -30,7 +30,12 @@ static long                     latch_timeout = 1000;
 static volatile sig_atomic_t    got_sighup = false;
 
 void _PG_init(void);
-PGDLLEXPORT void pg_net_worker(Datum main_arg) pg_attribute_noreturn();
+
+#if PG_VERSION_NUM >= 180000
+  PGDLLEXPORT pg_noreturn void pg_net_worker(Datum main_arg);
+#else
+  PGDLLEXPORT void pg_net_worker(Datum main_arg) pg_attribute_noreturn();
+#endif
 
 PG_FUNCTION_INFO_V1(worker_restart);
 Datum worker_restart(__attribute__ ((unused)) PG_FUNCTION_ARGS) {
@@ -135,6 +140,10 @@ void pg_net_worker(__attribute__ ((unused)) Datum main_arg) {
   if (worker_state->epfd < 0) {
     ereport(ERROR, errmsg("Failed to create event monitor file descriptor"));
   }
+
+  worker_state->curl_mhandle = curl_multi_init();
+  if(!worker_state->curl_mhandle)
+    ereport(ERROR, errmsg("curl_multi_init()"));
 
   set_curl_mhandle(worker_state);
 
