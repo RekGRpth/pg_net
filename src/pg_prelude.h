@@ -1,3 +1,6 @@
+#ifndef PG_PRELUDE_H
+#define PG_PRELUDE_H
+
 // pragmas needed to pass compiling with -Wextra
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -9,6 +12,7 @@
 #include <storage/condition_variable.h>
 #include <storage/ipc.h>
 #include <storage/latch.h>
+#include "storage/lmgr.h"
 #include <storage/proc.h>
 #include <storage/shmem.h>
 #include <access/xact.h>
@@ -19,6 +23,7 @@
 #include <catalog/pg_type.h>
 #include <commands/defrem.h>
 #include <commands/extension.h>
+#include "commands/dbcommands.h"
 #include <executor/spi.h>
 #include <fmgr.h>
 #include <miscadmin.h>
@@ -41,3 +46,24 @@
 #include <utils/varlena.h>
 
 #pragma GCC diagnostic pop
+
+const char *xact_event_name(XactEvent event);
+#endif /* PG_PRELUDE_H */
+
+#ifdef PG_PRELUDE_IMPL
+
+const char *xact_event_name(XactEvent event){
+  switch (event) {
+    case XACT_EVENT_COMMIT:                  return "XACT_EVENT_COMMIT";
+    case XACT_EVENT_PARALLEL_COMMIT:         return "XACT_EVENT_PARALLEL_COMMIT";
+    case XACT_EVENT_ABORT:                   return "XACT_EVENT_ABORT";
+    case XACT_EVENT_PARALLEL_ABORT:          return "XACT_EVENT_PARALLEL_ABORT";
+    case XACT_EVENT_PREPARE:                 return "XACT_EVENT_PREPARE";
+    case XACT_EVENT_PRE_COMMIT:              return "XACT_EVENT_PRE_COMMIT";
+    case XACT_EVENT_PARALLEL_PRE_COMMIT:     return "XACT_EVENT_PARALLEL_PRE_COMMIT";
+    case XACT_EVENT_PRE_PREPARE:             return "XACT_EVENT_PRE_PREPARE";
+    default:                                 return "(unknown XactEvent)";
+  }
+}
+
+#endif /* PG_PRELUDE_IMPL */

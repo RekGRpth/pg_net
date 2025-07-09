@@ -15,9 +15,6 @@ def sess(engine):
 
     session = Session(engine)
 
-    # no autocommit
-    session.connection().connection.set_isolation_level(0)
-
     # Reset sequences and tables between tests
     session.execute(text(
         """
@@ -36,3 +33,11 @@ def sess(engine):
     """
     ))
     session.commit()
+
+
+@pytest.fixture(scope="function")
+def autocommit_sess(engine):
+    ac_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
+    session = Session(ac_engine)
+
+    yield session
