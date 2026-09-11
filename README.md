@@ -1,9 +1,9 @@
 # PG_NET
 *A PostgreSQL extension that enables asynchronous (non-blocking) HTTP/HTTPS requests with SQL*.
 
-Requires libcurl >= 7.83. Compatible with PostgreSQL > = 12.
+Requires libcurl >= 7.83. Compatible with PostgreSQL > = 14.
 
-![PostgreSQL version](https://img.shields.io/badge/postgresql-12+-blue.svg)
+![PostgreSQL version](https://img.shields.io/badge/postgresql-14+-blue.svg)
 [![License](https://img.shields.io/pypi/l/markdown-subtemplate.svg)](https://github.com/supabase/pg_net/blob/master/LICENSE)
 [![Coverage Status](https://coveralls.io/repos/github/supabase/pg_net/badge.svg)](https://coveralls.io/github/supabase/pg_net)
 [![Tests](https://github.com/supabase/pg_net/actions/workflows/main.yml/badge.svg)](https://github.com/supabase/pg_net/actions)
@@ -91,8 +91,8 @@ When any of the three request functions (`http_get`, `http_post`, `http_delete`)
 Once a response is received, it gets stored in the `_http_response` table. By monitoring this table, you can keep track of response statuses and messages.
 
 > [!IMPORTANT]
-> Inserting directly into the `net.http_request_queue` won't cause the worker to process requests, you must use the request functions.
-> We do it this way to avoid polling the `net.http_request_queue` table, which would pollute `pg_stat_statements` and cause unnecesssary activity from the worker.
+> Inserting directly into `net.http_request_queue` won't wake the worker, you must use the request functions. Rows inserted directly are only processed the next time the worker wakes up.
+> We do it this way to avoid polling the `net.http_request_queue` table, which would pollute `pg_stat_statements` and cause unnecessary activity from the worker.
 
 The extension employs C's [libcurl](https://curl.se/libcurl/c/) library within a PostgreSQL [background worker](https://www.postgresql.org/docs/current/bgworker.html) to manage HTTP requests.
 This background worker sleeps until it receives a signal from the request functions, which awakes it and prompts it to read the `net.http_request_queue` table and execute the requests on it.
@@ -190,7 +190,7 @@ net.http_get(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 5000
 )
     -- request_id reference
     returns bigint
@@ -253,7 +253,7 @@ net.http_post(
     -- key/values to be included in request headers
     headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 5000
 )
     -- request_id reference
     returns bigint
@@ -328,7 +328,9 @@ net.http_delete(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 2000
+    timeout_milliseconds int default 5000,
+    -- body of the DELETE request
+    body jsonb default null
 )
     -- request_id reference
     returns bigint
