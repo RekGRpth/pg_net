@@ -30,14 +30,15 @@ typedef enum {
   WORKER_WAIT_ONE_SECOND,
 } WorkerWait;
 
-static WorkerState *worker_state = NULL;
+static WorkerState *worker_state            = NULL;
+static CURLM       *curl_mhandle            = NULL;
+static bool         curl_global_initialized = false;
 
 static const int    curl_handle_event_timeout_ms = 1000;
 static const int    net_worker_restart_time_sec  = 1;
 static const long   no_timeout                   = -1L;
 static bool         wake_commit_cb_active        = false;
 static bool         wake_commit_cb_registered    = false;
-static bool         worker_should_restart        = false;
 static const size_t total_extension_tables       = 2;
 
 static char *guc_ttl;
@@ -154,19 +155,6 @@ static void handle_sighup(PG_SIGNAL_PARAMS) {
   errno = save_errno;
 }
 
-/*
- *We have to handle sigusr1 explicitly because the default
- *procsignal_sigusr1_handler doesn't `SetLatch`, this would prevent
- *DROP DATATABASE from finishing since our worker would be sleeping and not reach
- *CHECK_FOR_INTERRUPTS()
- */
-static void handle_sigusr1(PG_SIGNAL_PARAMS) {
-  int save_errno = errno;
-  if (worker_state->shared_latch) SetLatch(worker_state->shared_latch);
-  errno = save_errno;
-  procsignal_sigusr1_handler(PG_SIGNAL_ARGS);
-}
-
 static void publish_state(WorkerStatus s) {
   pg_atomic_write_u32(&worker_state->status, (uint32)s);
   pg_write_barrier();
@@ -174,16 +162,21 @@ static void publish_state(WorkerStatus s) {
 }
 
 static void net_on_exit(__attribute__((unused)) int code, __attribute__((unused)) Datum arg) {
-  worker_should_restart = false;
   pg_atomic_write_u32(&worker_state->should_wake,
                       1); // ensure the remaining work will continue since we'll restart
 
   worker_state->shared_latch = NULL;
 
-  ev_monitor_close(worker_state);
+  event_monitor_close();
 
-  curl_multi_cleanup(worker_state->curl_mhandle);
-  curl_global_cleanup();
+  if (curl_mhandle) {
+    curl_multi_cleanup(curl_mhandle);
+    curl_mhandle = NULL;
+  }
+  if (curl_global_initialized) {
+    curl_global_cleanup();
+    curl_global_initialized = false;
+  }
 }
 
 // wait according to the wait type while ensuring interrupts are processed while waiting
@@ -258,10 +251,9 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
   worker_state->shared_latch = &MyProc->procLatch;
   on_proc_exit(net_on_exit, 0);
 
-  BackgroundWorkerUnblockSignals();
   pqsignal(SIGTERM, handle_sigterm);
   pqsignal(SIGHUP, handle_sighup);
-  pqsignal(SIGUSR1, handle_sigusr1);
+  BackgroundWorkerUnblockSignals();
 
   BackgroundWorkerInitializeConnection(guc_database_name, guc_username, 0);
   pgstat_report_appname("pg_net " EXTVERSION); // set appname for pg_stat_activity
@@ -274,22 +266,21 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
   int curl_ret = curl_global_init(CURL_GLOBAL_ALL);
   if (curl_ret != CURLE_OK)
     ereport(ERROR, errmsg("curl_global_init() returned %s\n", curl_easy_strerror(curl_ret)));
+  curl_global_initialized = true;
 
-  worker_state->epfd = event_monitor();
+  event_monitor_init();
 
-  if (worker_state->epfd < 0) {
-    ereport(ERROR, errmsg("Failed to create event monitor file descriptor"));
-  }
+  curl_mhandle = curl_multi_init();
+  if (!curl_mhandle) ereport(ERROR, errmsg("curl_multi_init()"));
 
-  worker_state->curl_mhandle = curl_multi_init();
-  if (!worker_state->curl_mhandle) ereport(ERROR, errmsg("curl_multi_init()"));
-
-  set_curl_mhandle(worker_state);
+  set_curl_mhandle(curl_mhandle);
 
   publish_state(WS_RUNNING);
 
   // Initial state: we go straight into the outer loop and wait for a wake.
   pgstat_report_activity(STATE_IDLE, NULL);
+
+  bool worker_should_restart = false;
 
   do {
 
@@ -319,7 +310,8 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         break;
       }
 
-      SPI_connect();
+      int ret = SPI_connect();
+      if (ret != SPI_OK_CONNECT) elog(ERROR, "SPI_connect failed with error %d", ret);
 
       expired_responses = delete_expired_responses(guc_ttl, guc_batch_size);
 
@@ -346,7 +338,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             continue;
           }
 
-          EREPORT_MULTI(curl_multi_add_handle(worker_state->curl_mhandle, handles[j].ez_handle));
+          EREPORT_MULTI(curl_multi_add_handle(curl_mhandle, handles[j].ez_handle));
         }
 
         // start curl event loop
@@ -355,8 +347,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         event events[maxevents];
 
         do {
-          int nfds =
-              wait_event(worker_state->epfd, events, maxevents, curl_handle_event_timeout_ms);
+          int nfds = wait_event(events, maxevents, curl_handle_event_timeout_ms);
 
           if (nfds < 0) {
             int save_errno = errno;
@@ -372,21 +363,21 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
           for (int i = 0; i < nfds; i++) {
             if (is_timer(events[i])) {
-              EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle,
-                                                     CURL_SOCKET_TIMEOUT, 0, &running_handles));
+              EREPORT_MULTI(
+                  curl_multi_socket_action(curl_mhandle, CURL_SOCKET_TIMEOUT, 0, &running_handles));
             } else {
               int curl_event = get_curl_event(events[i]);
               int sockfd     = get_socket_fd(events[i]);
 
-              EREPORT_MULTI(curl_multi_socket_action(worker_state->curl_mhandle, sockfd, curl_event,
-                                                     &running_handles));
+              EREPORT_MULTI(
+                  curl_multi_socket_action(curl_mhandle, sockfd, curl_event, &running_handles));
             }
           }
 
           // insert finished responses
           CURLMsg *msg       = NULL;
           int      msgs_left = 0;
-          while ((msg = curl_multi_info_read(worker_state->curl_mhandle, &msgs_left))) {
+          while ((msg = curl_multi_info_read(curl_mhandle, &msgs_left))) {
             if (msg->msg == CURLMSG_DONE) {
               CurlHandle *handle = NULL;
               EREPORT_CURL_GETINFO(msg->easy_handle, CURLINFO_PRIVATE, &handle);
@@ -404,8 +395,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         // cleanup
         for (uint64 i = 0; i < requests_consumed; i++) {
           if (!handles[i].rejected_reason) {
-            EREPORT_MULTI(
-                curl_multi_remove_handle(worker_state->curl_mhandle, handles[i].ez_handle));
+            EREPORT_MULTI(curl_multi_remove_handle(curl_mhandle, handles[i].ez_handle));
           }
 
           curl_easy_cleanup(handles[i].ez_handle);
@@ -416,7 +406,8 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         pfree(handles);
       }
 
-      SPI_finish();
+      ret = SPI_finish();
+      if (ret != SPI_OK_FINISH) elog(ERROR, "SPI_finish failed with error %d", ret);
 
       unlock_extension(ext_table_oids);
 
@@ -517,8 +508,6 @@ static void net_shmem_startup(void) {
     worker_state->shared_latch = NULL;
 
     ConditionVariableInit(&worker_state->cv);
-    worker_state->epfd         = 0;
-    worker_state->curl_mhandle = NULL;
   }
 
   LWLockRelease(AddinShmemInitLock);
