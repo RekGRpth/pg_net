@@ -61,12 +61,27 @@ PGDLLEXPORT pg_noreturn void pg_net_worker(Datum main_arg);
 PGDLLEXPORT void pg_net_worker(Datum main_arg) pg_attribute_noreturn();
 #endif
 
+/*
+ * Set the shared latch.
+ *
+ * It avoids a narrow race condition in which the latch is set to
+ * NULL by the pg_net background worker between checking the latch
+ * pointer for null and calling SetLatch. To avoid this race the
+ * shared_latch in the WorkerState struct is marked as a volatile
+ * pointer. This volatile pointer is then loaded once in this
+ * function and only that loaded value is then checked for NULL
+ * and passed to SetLatch.
+ */
+static void SetSharedLatch(void) {
+  Latch *latch = worker_state->shared_latch;
+  if (latch) SetLatch(latch);
+}
+
 PG_FUNCTION_INFO_V1(worker_restart);
 Datum worker_restart(__attribute__((unused)) PG_FUNCTION_ARGS) {
   bool result = DatumGetBool(DirectFunctionCall1(pg_reload_conf, (Datum)NULL)); // reload the config
   pg_atomic_write_u32(&worker_state->got_restart, 1);
-  pg_write_barrier();
-  if (worker_state->shared_latch) SetLatch(worker_state->shared_latch);
+  SetSharedLatch();
   PG_RETURN_BOOL(result); // TODO is not necessary to return a bool here, but we do it to maintain
                           // backward compatibility
 }
@@ -102,11 +117,12 @@ static void wake_at_commit(XactEvent event, __attribute__((unused)) void *arg) {
     if (wake_commit_cb_active) {
       uint32 expected = 0;
       bool   success  = pg_atomic_compare_exchange_u32(&worker_state->should_wake, &expected, 1);
-      pg_write_barrier();
 
-      if (success) // only wake the worker on first put, so if many concurrent wakes come we only
-                   // wake once
-        SetLatch(worker_state->shared_latch);
+      if (success) {
+        // only wake the worker on first put, so if many concurrent wakes come we only
+        // wake once
+        SetSharedLatch();
+      }
 
       wake_commit_cb_active = false;
     }
@@ -143,21 +159,19 @@ Datum wake(__attribute__((unused)) PG_FUNCTION_ARGS) {
 static void handle_sigterm(PG_SIGNAL_PARAMS) {
   int save_errno = errno;
   pg_atomic_write_u32(&worker_state->got_restart, 1);
-  pg_write_barrier();
-  if (worker_state->shared_latch) SetLatch(worker_state->shared_latch);
+  SetSharedLatch();
   errno = save_errno;
 }
 
 static void handle_sighup(PG_SIGNAL_PARAMS) {
   int save_errno = errno;
   got_sighup     = true;
-  if (worker_state->shared_latch) SetLatch(worker_state->shared_latch);
+  SetSharedLatch();
   errno = save_errno;
 }
 
 static void publish_state(WorkerStatus s) {
   pg_atomic_write_u32(&worker_state->status, (uint32)s);
-  pg_write_barrier();
   ConditionVariableBroadcast(&worker_state->cv);
 }
 
@@ -167,8 +181,6 @@ static void net_on_exit(__attribute__((unused)) int code, __attribute__((unused)
 
   worker_state->shared_latch = NULL;
 
-  event_monitor_close();
-
   if (curl_mhandle) {
     curl_multi_cleanup(curl_mhandle);
     curl_mhandle = NULL;
@@ -177,6 +189,10 @@ static void net_on_exit(__attribute__((unused)) int code, __attribute__((unused)
     curl_global_cleanup();
     curl_global_initialized = false;
   }
+
+  // Must be closed after curl cleanup functions because they depend
+  // on epfd being valid
+  event_monitor_close();
 }
 
 // wait according to the wait type while ensuring interrupts are processed while waiting
@@ -329,6 +345,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         SPITupleTable *queue_rows = SPI_tuptable;
 
         // initialize curl handles
+        int running_handles = 0;
         for (size_t j = 0; j < requests_consumed; j++) {
           init_curl_handle(&handles[j],
                            get_request_queue_row(queue_rows->vals[j], queue_rows->tupdesc));
@@ -339,20 +356,26 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           }
 
           EREPORT_MULTI(curl_multi_add_handle(curl_mhandle, handles[j].ez_handle));
+          running_handles++;
         }
 
         // start curl event loop
-        int   running_handles = 0;
-        int   maxevents       = requests_consumed + 1; // 1 extra for the timer
+        int   maxevents = requests_consumed + 1; // 1 extra for the timer
         event events[maxevents];
 
-        do {
+        // run while there are curl handles, some won't finish in a single iteration
+        // since they could be slow and waiting for a timeout
+        while (running_handles > 0) {
           int nfds = wait_event(events, maxevents, curl_handle_event_timeout_ms);
 
           if (nfds < 0) {
             int save_errno = errno;
-            if (save_errno == EINTR) { // can happen when the wait is interrupted, for example when
-                                       // running under GDB. Just continue in this case.
+            // EINTR is returned when a signal is delivered to the process while
+            // it's waiting inside `wait_event` (`epoll_wait`/`kqueue` to be precise).
+            // This could be SIGTRAP from GDB or SIGHUP from a pg_reload_conf call (or
+            // any other signal). In any case, we need to retry the `wait_event` call,
+            // hence we continue.
+            if (save_errno == EINTR) {
               elog(DEBUG1, "wait_event() got %s, continuing", strerror(save_errno));
               continue;
             } else {
@@ -388,9 +411,7 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
           }
 
           elog(DEBUG1, "Pending curl running_handles: %d", running_handles);
-          // run while there are curl handles, some won't finish in a single iteration since they
-          // could be slow and waiting for a timeout
-        } while (running_handles > 0);
+        }
 
         // cleanup
         for (uint64 i = 0; i < requests_consumed; i++) {
